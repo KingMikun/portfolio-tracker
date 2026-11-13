@@ -11,10 +11,10 @@ HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 def hl_post(payload):
     try:
         r = requests.post(HL_INFO_URL, json=payload, timeout=15)
-        r.raise_for_status()
+        if r.status_code != 200:
+            return None
         return r.json()
-    except Exception as e:
-        st.error(f"Hyperliquid API error: {e}")
+    except Exception:
         return None
 
 @st.cache_data(ttl=60)
@@ -201,7 +201,7 @@ if selected_token:
     
     cg_map = {
         "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
-        "HYPE": "hyperliquid", "KNTQ": "kintsu"
+        "HYPE": "hyperliquid", "KNTQ": "kinetiq"
     }
     cg_id = cg_map.get(selected_token, selected_token.lower())
     
@@ -233,7 +233,7 @@ if selected_token:
     
     st.subheader("Basic Technicals (Hyperliquid)")
     candles = get_candles(selected_token, "1h", 72)
-    if candles and len(candles) > 10:
+    if candles and isinstance(candles, list) and len(candles) > 10:
         cdf = pd.DataFrame(candles)
         cdf["c"] = cdf["c"].astype(float)
         cdf["time"] = pd.to_datetime(cdf["t"], unit="ms")
@@ -263,7 +263,7 @@ if selected_token:
         )
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No Hyperliquid candle data for this token.")
+        st.info("No Hyperliquid candle data available for this token (common for pure spot tokens without perps).")
 
 # === Opportunities Scanner ===
 st.header("🚀 Hyperliquid Futures Opportunities")
