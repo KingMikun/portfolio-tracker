@@ -1,6 +1,5 @@
 streamlit
-yfinance
 requests
 pandas
 plotly
-matplotlib
+
