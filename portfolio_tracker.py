@@ -228,7 +228,7 @@ if st.button("🔄 Scan Opportunities Now", type="primary") or True:
                     "Ann. Fund ~%": "{:.1f}",
                     "Volume $": "{:,.0f}",
                     "OI": "{:.2f}"
-                }).applymap(highlight_bias, subset=["Bias"]),
+                }).map(highlight_bias, subset=["Bias"]),
                 use_container_width=True
             )
             st.success(f"Found {len(opps)} setups. **Bias** column shows recommended side (Long/Short).")
