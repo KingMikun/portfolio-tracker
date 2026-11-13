@@ -30,8 +30,27 @@ def get_hl_spot_balances(address):
     return hl_post({"type": "spotClearinghouseState", "user": address})
 
 @st.cache_data(ttl=30)
-def get_meta_and_ctxs():
-    return hl_post({"type": "metaAndAssetCtxs"})
+def get_all_mids():
+    return hl_post({"type": "allMids"})
+
+def get_current_price(token):
+    """Try Hyperliquid mids first, then CoinGecko."""
+    mids = get_all_mids()
+    if mids and token in mids:
+        try:
+            return float(mids[token])
+        except:
+            pass
+    # CoinGecko fallback
+    cg_map = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "HYPE": "hyperliquid", "KNTQ": "kinetiq"}
+    cg_id = cg_map.get(token, token.lower())
+    try:
+        r = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd", timeout=8)
+        if r.ok:
+            return r.json().get(cg_id, {}).get("usd")
+    except:
+        pass
+    return None
 
 @st.cache_data(ttl=300)
 def get_candles(coin, interval="1h", hours=48):
@@ -42,7 +61,44 @@ def get_candles(coin, interval="1h", hours=48):
         "req": {"coin": coin, "interval": interval, "startTime": start, "endTime": end}
     })
 
-def score_opportunity(funding, day_change_pct, volume, oi, mark):
+def get_technical_levels(coin, mark, bias):
+    """Return TP/SL based on recent swings / ATR proxy. Fallback to wider fixed %."""
+    candles = get_candles(coin, "1h", 72)
+    if not candles or not isinstance(candles, list) or len(candles) < 20:
+        # Wider fallback
+        if bias == "Long":
+            return mark * 1.15, mark * 0.92, "Fallback: +15% TP / -8% SL"
+        if bias == "Short":
+            return mark * 0.85, mark * 1.08, "Fallback: -15% TP / +8% SL"
+        return None, None, "No clear levels"
+
+    df = pd.DataFrame(candles)
+    df["h"] = df["h"].astype(float)
+    df["l"] = df["l"].astype(float)
+    df["c"] = df["c"].astype(float)
+
+    # Simple ATR proxy (avg true range over last 14)
+    tr = pd.concat([
+        df["h"] - df["l"],
+        (df["h"] - df["c"].shift()).abs(),
+        (df["l"] - df["c"].shift()).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.tail(14).mean()
+
+    recent_high = df["h"].tail(20).max()
+    recent_low = df["l"].tail(20).min()
+
+    if bias == "Long":
+        tp = max(recent_high, mark + 1.5 * atr)
+        sl = min(recent_low, mark - 1.0 * atr)
+        note = f"Tech: TP ~{tp:.4f} (swing/ATR), SL ~{sl:.4f}"
+    elif bias == "Short":
+        tp = min(recent_low, mark - 1.5 * atr)
+        sl = max(recent_high, mark + 1.0 * atr)
+        note = f"Tech: TP ~{tp:.4f} (swing/ATR), SL ~{sl:.4f}"
+    else:
+        tp, sl, note = None, None, "Neutral"
+    return tp, sl, note
     """Score setups and return bias (Long/Short)."""
     score = 0
     reasons = []
@@ -165,13 +221,25 @@ else:
                     "Entry Notional": float(b.get("entryNtl", 0))
                 })
             if spot_rows:
+                # Enrich with current price
+                for r in spot_rows:
+                    px = get_current_price(r["Token"])
+                    r["Current Price"] = px
+                    r["Current Value"] = (px * r["Total"]) if px else None
+                    r["uPnL"] = (r["Current Value"] - r["Entry Notional"]) if (px and r["Entry Notional"]) else None
+
                 sdf = pd.DataFrame(spot_rows)
                 st.dataframe(sdf.style.format({
-                    "Total": "{:.4f}", "Hold": "{:.4f}", "Available": "{:.4f}", "Entry Notional": "{:.2f}"
+                    "Total": "{:.4f}", "Hold": "{:.4f}", "Available": "{:.4f}",
+                    "Entry Notional": "{:.2f}", "Current Price": "{:.4f}",
+                    "Current Value": "{:.2f}", "uPnL": "{:+.2f}"
                 }), use_container_width=True)
                 
                 total_entry = sdf["Entry Notional"].sum()
+                total_current = sdf["Current Value"].sum(skipna=True)
                 st.metric("Total Spot Entry Value", f"${total_entry:,.2f}")
+                if total_current:
+                    st.metric("Total Spot Current Value", f"${total_current:,.2f}", f"{total_current - total_entry:+,.0f}")
                 # Store spot tokens for later use
                 st.session_state.spot_tokens = [r["Token"] for r in spot_rows]
             else:
@@ -287,12 +355,13 @@ if st.button("🔄 Scan Opportunities Now", type="primary") or True:
                 oi = float(ctx.get("openInterest", 0))
                 score, reasons, bias = score_opportunity(funding, day_chg, vol, oi, mark)
                 if score >= 25:
+                    tp, sl, tech_note = get_technical_levels(coin, mark, bias)
                     # Sample exit & thesis
                     if bias == "Long":
-                        sample_exit = "Take profit at +8–15% or if funding flips positive. Trail stop under recent swing low."
+                        sample_exit = f"TP near {tp:.4f} / SL near {sl:.4f}. {tech_note}. Exit if funding flips positive."
                         thesis = "Negative/low funding + upward momentum suggests longs are being paid and price is rising. Expect continuation or short squeeze."
                     elif bias == "Short":
-                        sample_exit = "Take profit at -8–15% or if funding flips negative. Trail stop above recent swing high."
+                        sample_exit = f"TP near {tp:.4f} / SL near {sl:.4f}. {tech_note}. Exit if funding flips negative."
                         thesis = "Positive funding + downward momentum suggests shorts are being paid and price is falling. Expect continuation or long liquidations."
                     else:
                         sample_exit = "No clear directional edge. Wait for stronger funding/momentum alignment."
@@ -335,6 +404,24 @@ if st.button("🔄 Scan Opportunities Now", type="primary") or True:
             )
             st.success(f"Found {len(opps)} setups. **Bias** shows recommended side.")
 
+            # Store for results tracking
+            if "tracked_opps" not in st.session_state:
+                st.session_state.tracked_opps = []
+            for _, row in opps_df.iterrows():
+                key = f"{row['Coin']}_{row['Bias']}_{datetime.now().strftime('%Y%m%d%H')}"
+                if not any(t.get("key") == key for t in st.session_state.tracked_opps):
+                    st.session_state.tracked_opps.append({
+                        "key": key,
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "coin": row["Coin"],
+                        "bias": row["Bias"],
+                        "score": row["Score"],
+                        "entry_mark": row["Mark"],
+                        "tp": tp if 'tp' in dir() else None,
+                        "sl": sl if 'sl' in dir() else None,
+                        "status": "Open"
+                    })
+
             # Detailed view with thesis & exit
             st.subheader("Setup Details (Thesis + Sample Exit)")
             for _, row in opps_df.iterrows():
@@ -372,7 +459,7 @@ if st.button("🔄 Scan Opportunities Now", type="primary") or True:
 
 # === Simple Backtest of Sample Exits ===
 st.header("📊 Backtest Sample Exits")
-st.caption("Simulates the sample exit rules on recent 1h data for top opportunities. Fixed 10% TP / 5% SL proxy.")
+st.caption("Simulates technical-based exits (swing/ATR) on recent 1h data. Falls back to +15% / -8% if candles unavailable.")
 
 if st.button("Run Backtest on Top Setups"):
     if 'opps_df' in locals() and not opps_df.empty:
@@ -422,6 +509,55 @@ if st.button("Run Backtest on Top Setups"):
             st.info("Not enough candle data for backtest.")
     else:
         st.info("Scan opportunities first.")
+
+# === Opportunity Results Tracker ===
+st.header("📋 Opportunity Results Tracker")
+st.caption("Tracks scanned setups so you can monitor outcomes even if you don't enter. Data stays in this session.")
+
+if "tracked_opps" not in st.session_state:
+    st.session_state.tracked_opps = []
+
+if st.session_state.tracked_opps:
+    # Update open trades with current price
+    mids = get_all_mids() or {}
+    updated = []
+    for t in st.session_state.tracked_opps:
+        if t["status"] == "Open":
+            cur = mids.get(t["coin"])
+            if cur:
+                cur = float(cur)
+                if t["bias"] == "Long":
+                    ret = (cur / t["entry_mark"] - 1) * 100
+                    tp_hit = t.get("tp") and cur >= t["tp"]
+                    sl_hit = t.get("sl") and cur <= t["sl"]
+                else:
+                    ret = (t["entry_mark"] / cur - 1) * 100
+                    tp_hit = t.get("tp") and cur <= t["tp"]
+                    sl_hit = t.get("sl") and cur >= t["sl"]
+                t["current_return"] = ret
+                if tp_hit:
+                    t["status"] = "TP Hit"
+                elif sl_hit:
+                    t["status"] = "SL Hit"
+                elif ret >= 15:
+                    t["status"] = "TP Hit"
+                elif ret <= -8:
+                    t["status"] = "SL Hit"
+        updated.append(t)
+    st.session_state.tracked_opps = updated
+
+    tdf = pd.DataFrame(st.session_state.tracked_opps)
+    st.dataframe(tdf, use_container_width=True)
+
+    closed = [t for t in st.session_state.tracked_opps if t["status"] != "Open"]
+    if closed:
+        wins = sum(1 for t in closed if t["status"] == "TP Hit")
+        st.metric("Tracked Win Rate", f"{wins / len(closed) * 100:.0f}%", f"{len(closed)} closed")
+    if st.button("Clear Tracked Results"):
+        st.session_state.tracked_opps = []
+        st.rerun()
+else:
+    st.info("Scan opportunities first to start tracking results.")
 
 st.divider()
 st.caption("⚠️ Research tool only — not financial advice. Always DYOR. Spot + perp data is public via Hyperliquid API. Backtest is a simple proxy, not a full simulation.")
