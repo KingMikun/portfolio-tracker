@@ -103,6 +103,8 @@ def get_technical_levels(coin, mark, bias):
     else:
         tp, sl, note = None, None, "Neutral"
     return tp, sl, note
+
+def score_opportunity(funding, day_change_pct, volume, oi, mark):
     """Score setups and return bias (Long/Short)."""
     score = 0
     reasons = []
