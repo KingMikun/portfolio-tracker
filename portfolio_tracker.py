@@ -96,7 +96,7 @@ hl_address = st.sidebar.text_input(
 )
 tracked_crypto = st.sidebar.text_area(
     "Tracked Crypto Tokens (one per line)",
-    value="BTC\nETH\nSOL\nHYPE",
+    value="BTC\nETH\nSOL\nHYPE\nKNTQ",
     help="Used for fundamentals section"
 )
 
@@ -169,10 +169,103 @@ else:
                 st.dataframe(sdf.style.format({
                     "Total": "{:.4f}", "Hold": "{:.4f}", "Available": "{:.4f}", "Entry Notional": "{:.2f}"
                 }), use_container_width=True)
+                
+                total_entry = sdf["Entry Notional"].sum()
+                st.metric("Total Spot Entry Value", f"${total_entry:,.2f}")
+                # Store spot tokens for later use
+                st.session_state.spot_tokens = [r["Token"] for r in spot_rows]
             else:
                 st.info("No spot balances.")
+                st.session_state.spot_tokens = []
         else:
             st.warning("Could not fetch spot balances.")
+            st.session_state.spot_tokens = []
+else:
+    st.session_state.spot_tokens = []
+
+# === Token Details (Fundamentals + Technicals) ===
+st.header("🔍 Token Details (Fundamentals & Technicals)")
+st.caption("Auto-includes tokens from your spot balances. Also covers tracked list + KNTQ.")
+
+spot_tokens = st.session_state.get("spot_tokens", [])
+all_tokens = list(dict.fromkeys(spot_tokens + ["BTC", "ETH", "SOL", "HYPE", "KNTQ"]))
+if tracked_crypto:
+    custom = [t.strip().upper() for t in tracked_crypto.strip().split("\n") if t.strip()]
+    all_tokens = list(dict.fromkeys(all_tokens + custom))
+
+if not all_tokens:
+    all_tokens = ["BTC", "ETH", "SOL", "HYPE", "KNTQ"]
+
+selected_token = st.selectbox("Select Token", all_tokens, index=0 if all_tokens else 0)
+
+if selected_token:
+    st.subheader(f"{selected_token}")
+    
+    cg_map = {
+        "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
+        "HYPE": "hyperliquid", "KNTQ": "kintsu"
+    }
+    cg_id = cg_map.get(selected_token, selected_token.lower())
+    
+    cols = st.columns(4)
+    try:
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/coins/{cg_id}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false",
+            timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            md = data.get("market_data", {})
+            cols[0].metric("Price", f"${md.get('current_price', {}).get('usd', 0):,.4f}")
+            cols[1].metric("24h Change", f"{md.get('price_change_percentage_24h', 0):+.2f}%")
+            cols[2].metric("Market Cap", f"${md.get('market_cap', {}).get('usd', 0)/1e6:,.1f}M")
+            cols[3].metric("24h Volume", f"${md.get('total_volume', {}).get('usd', 0)/1e6:,.1f}M")
+            
+            st.write("**Description:**", (data.get("description", {}).get("en") or "No description available.")[:600] + "...")
+            
+            st.markdown(
+                f"[CoinGecko](https://www.coingecko.com/en/coins/{cg_id}) | "
+                f"[Hyperliquid Spot](https://app.hyperliquid.xyz/trade/{selected_token}/USDC) | "
+                f"[X Search](https://x.com/search?q={selected_token})"
+            )
+        else:
+            cols[0].info("Price data unavailable on CoinGecko")
+    except Exception as e:
+        st.warning(f"Fundamentals fetch failed: {e}")
+    
+    st.subheader("Basic Technicals (Hyperliquid)")
+    candles = get_candles(selected_token, "1h", 72)
+    if candles and len(candles) > 10:
+        cdf = pd.DataFrame(candles)
+        cdf["c"] = cdf["c"].astype(float)
+        cdf["time"] = pd.to_datetime(cdf["t"], unit="ms")
+        
+        last_price = cdf["c"].iloc[-1]
+        sma_20 = cdf["c"].tail(20).mean()
+        sma_50 = cdf["c"].tail(50).mean() if len(cdf) >= 50 else None
+        
+        tcols = st.columns(3)
+        tcols[0].metric("Last Price (HL)", f"${last_price:,.4f}")
+        tcols[1].metric("SMA 20", f"${sma_20:,.4f}", f"{((last_price/sma_20)-1)*100:+.1f}%")
+        if sma_50:
+            tcols[2].metric("SMA 50", f"${sma_50:,.4f}", f"{((last_price/sma_50)-1)*100:+.1f}%")
+        
+        fig = go.Figure(data=[go.Candlestick(
+            x=cdf["time"],
+            open=cdf["o"].astype(float),
+            high=cdf["h"].astype(float),
+            low=cdf["l"].astype(float),
+            close=cdf["c"]
+        )])
+        fig.add_hline(y=sma_20, line_dash="dash", line_color="orange", annotation_text="SMA20")
+        fig.update_layout(
+            title=f"{selected_token} 1h Chart",
+            xaxis_rangeslider_visible=False,
+            height=400
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No Hyperliquid candle data for this token.")
 
 # === Opportunities Scanner ===
 st.header("🚀 Hyperliquid Futures Opportunities")
@@ -196,6 +289,17 @@ if st.button("🔄 Scan Opportunities Now", type="primary") or True:
                 oi = float(ctx.get("openInterest", 0))
                 score, reasons, bias = score_opportunity(funding, day_chg, vol, oi, mark)
                 if score >= 25:
+                    # Sample exit & thesis
+                    if bias == "Long":
+                        sample_exit = "Take profit at +8–15% or if funding flips positive. Trail stop under recent swing low."
+                        thesis = "Negative/low funding + upward momentum suggests longs are being paid and price is rising. Expect continuation or short squeeze."
+                    elif bias == "Short":
+                        sample_exit = "Take profit at -8–15% or if funding flips negative. Trail stop above recent swing high."
+                        thesis = "Positive funding + downward momentum suggests shorts are being paid and price is falling. Expect continuation or long liquidations."
+                    else:
+                        sample_exit = "No clear directional edge. Wait for stronger funding/momentum alignment."
+                        thesis = "Mixed signals. Funding and price action not strongly aligned."
+
                     opps.append({
                         "Coin": coin,
                         "Bias": bias,
@@ -206,6 +310,8 @@ if st.button("🔄 Scan Opportunities Now", type="primary") or True:
                         "Ann. Fund ~%": funding * 3 * 365 * 100,
                         "Volume $": vol,
                         "OI": oi,
+                        "Sample Exit": sample_exit,
+                        "Thesis": thesis,
                         "Reasons": "; ".join(reasons)
                     })
             except:
@@ -221,17 +327,24 @@ if st.button("🔄 Scan Opportunities Now", type="primary") or True:
                     return "background-color: #cf222e; color: white"
                 return ""
             st.dataframe(
-                opps_df.style.format({
+                opps_df[["Coin", "Bias", "Score", "Mark", "24h %", "Ann. Fund ~%", "Volume $"]].style.format({
                     "Mark": "{:.4f}",
                     "24h %": "{:+.2f}",
-                    "Funding %/h": "{:.4f}",
                     "Ann. Fund ~%": "{:.1f}",
-                    "Volume $": "{:,.0f}",
-                    "OI": "{:.2f}"
+                    "Volume $": "{:,.0f}"
                 }).map(highlight_bias, subset=["Bias"]),
                 use_container_width=True
             )
-            st.success(f"Found {len(opps)} setups. **Bias** column shows recommended side (Long/Short).")
+            st.success(f"Found {len(opps)} setups. **Bias** shows recommended side.")
+
+            # Detailed view with thesis & exit
+            st.subheader("Setup Details (Thesis + Sample Exit)")
+            for _, row in opps_df.iterrows():
+                with st.expander(f"{row['Coin']} — {row['Bias']} (Score {row['Score']})"):
+                    st.write(f"**Thesis:** {row['Thesis']}")
+                    st.write(f"**Sample Exit:** {row['Sample Exit']}")
+                    st.write(f"**Reasons:** {row['Reasons']}")
+                    st.write(f"**Funding:** {row['Funding %/h']:.4f}%/h (~{row['Ann. Fund ~%']:.1f}% ann.)")
 
             # Chart for top opportunity
             if not opps_df.empty:
@@ -259,5 +372,58 @@ if st.button("🔄 Scan Opportunities Now", type="primary") or True:
     else:
         st.error("Failed to fetch market data.")
 
+# === Simple Backtest of Sample Exits ===
+st.header("📊 Backtest Sample Exits")
+st.caption("Simulates the sample exit rules on recent 1h data for top opportunities. Fixed 10% TP / 5% SL proxy.")
+
+if st.button("Run Backtest on Top Setups"):
+    if 'opps_df' in locals() and not opps_df.empty:
+        bt_results = []
+        for _, row in opps_df.head(5).iterrows():
+            coin = row["Coin"]
+            bias = row["Bias"]
+            candles = get_candles(coin, "1h", 168)
+            if not candles or len(candles) < 20:
+                continue
+            cdf = pd.DataFrame(candles)
+            cdf["c"] = cdf["c"].astype(float)
+            entry = cdf["c"].iloc[-48] if len(cdf) > 48 else cdf["c"].iloc[0]
+            future = cdf["c"].iloc[-48:] if len(cdf) > 48 else cdf["c"]
+            
+            if bias == "Long":
+                tp = entry * 1.10
+                sl = entry * 0.95
+                hit_tp = any(future >= tp)
+                hit_sl = any(future <= sl)
+                final_ret = (future.iloc[-1] / entry - 1) * 100
+            elif bias == "Short":
+                tp = entry * 0.90
+                sl = entry * 1.05
+                hit_tp = any(future <= tp)
+                hit_sl = any(future >= sl)
+                final_ret = (entry / future.iloc[-1] - 1) * 100
+            else:
+                continue
+            
+            outcome = "TP Hit" if hit_tp else ("SL Hit" if hit_sl else "Open")
+            bt_results.append({
+                "Coin": coin,
+                "Bias": bias,
+                "Entry": entry,
+                "Outcome": outcome,
+                "Final Return %": final_ret
+            })
+        
+        if bt_results:
+            bt_df = pd.DataFrame(bt_results)
+            st.dataframe(bt_df.style.format({"Entry": "{:.4f}", "Final Return %": "{:+.2f}"}), use_container_width=True)
+            wins = sum(1 for r in bt_results if r["Outcome"] == "TP Hit")
+            st.metric("Win Rate (TP Hit)", f"{wins / len(bt_results) * 100:.0f}%")
+            st.metric("Avg Final Return", f"{bt_df['Final Return %'].mean():+.2f}%")
+        else:
+            st.info("Not enough candle data for backtest.")
+    else:
+        st.info("Scan opportunities first.")
+
 st.divider()
-st.caption("⚠️ Research tool only — not financial advice. Always DYOR. Spot + perp data is public via Hyperliquid API.")
+st.caption("⚠️ Research tool only — not financial advice. Always DYOR. Spot + perp data is public via Hyperliquid API. Backtest is a simple proxy, not a full simulation.")
