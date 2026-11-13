@@ -180,8 +180,6 @@ else:
         else:
             st.warning("Could not fetch spot balances.")
             st.session_state.spot_tokens = []
-else:
-    st.session_state.spot_tokens = []
 
 # === Token Details (Fundamentals + Technicals) ===
 st.header("🔍 Token Details (Fundamentals & Technicals)")
