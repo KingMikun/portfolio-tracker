@@ -33,6 +33,10 @@ def get_hl_spot_balances(address):
 def get_all_mids():
     return hl_post({"type": "allMids"})
 
+@st.cache_data(ttl=30)
+def get_meta_and_ctxs():
+    return hl_post({"type": "metaAndAssetCtxs"})
+
 def get_current_price(token):
     """Try Hyperliquid mids first, then CoinGecko."""
     mids = get_all_mids()
